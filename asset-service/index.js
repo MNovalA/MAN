@@ -198,4 +198,7 @@ app.get('/api/maintenance/asset/:asset_id', async (req, res) => {
     }
 });
 
-app.listen(3001, () => console.log('📦 Asset Service running on port 3001'));
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(3001, () => console.log('📦 Asset Service running on port 3001'));
+}
+module.exports = app;

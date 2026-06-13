@@ -48,4 +48,7 @@ app.delete('/api/wards/:id', async (req, res) => {
     }
 });
 
-app.listen(3002, () => console.log('🏥 Ward Service running on port 3002'));
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(3002, () => console.log('🏥 Ward Service running on port 3002'));
+}
+module.exports = app;

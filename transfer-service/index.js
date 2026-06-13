@@ -125,4 +125,7 @@ app.delete('/api/transfers/cancel/:asset_id', async (req, res) => {
     }
 });
 
-app.listen(3003, () => console.log('🚚 Transfer Service running on port 3003'));
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(3003, () => console.log('🚚 Transfer Service running on port 3003'));
+}
+module.exports = app;

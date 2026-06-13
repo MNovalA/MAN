@@ -195,4 +195,7 @@ function requireRole(role) {
     };
 }
 
-app.listen(3004, () => console.log('🔐 Auth Service running on port 3004'));
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(3004, () => console.log('🔐 Auth Service running on port 3004'));
+}
+module.exports = app;
