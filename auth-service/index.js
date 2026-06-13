@@ -2,16 +2,15 @@ const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { graphqlHTTP } = require('express-graphql');
-const { buildSchema } = require('graphql');
 require('dotenv').config();
 
 const app = express();
-// app.use(express.json());
+app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hospital_asset_jwt_secret_change_in_prod';
 const SALT_ROUNDS = 10;
 
+// Isolated connection just for the Auth Service
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     port: process.env.DB_PORT,
@@ -19,64 +18,6 @@ const db = mysql.createPool({
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME
 }).promise();
-
-// ==========================================
-// GRAPHQL SCHEMA
-// ==========================================
-const schema = buildSchema(`
-    type User {
-        id: ID!
-        username: String!
-        role: String!
-        created_at: String
-    }
-
-    type AuthPayload {
-        message: String!
-        token: String
-        user: User
-    }
-
-    type VerifyPayload {
-        valid: Boolean!
-        user: TokenUser
-        error: String
-    }
-
-    type TokenUser {
-        id: ID!
-        username: String!
-        role: String!
-    }
-
-    type MutationResult {
-        message: String!
-        user: User
-    }
-
-    type DeleteResult {
-        message: String!
-    }
-
-    type Query {
-        """Validate a JWT token. Pass the token in the Authorization header."""
-        verifyToken: VerifyPayload!
-
-        """List all users. Requires admin role."""
-        users: [User!]!
-    }
-
-    type Mutation {
-        """Register a new user account."""
-        register(username: String!, password: String!, role: String): MutationResult!
-
-        """Login and receive a JWT token."""
-        login(username: String!, password: String!): AuthPayload!
-
-        """Delete a user by ID. Requires admin role."""
-        deleteUser(id: ID!): DeleteResult!
-    }
-`);
 
 // ==========================================
 // SEED DEFAULT ACCOUNTS ON STARTUP
@@ -100,50 +41,27 @@ async function seedDefaultUsers() {
 seedDefaultUsers();
 
 // ==========================================
-// HELPER MIDDLEWARE
+// POST /api/auth/register
+// Body: { username, password, role? }
 // ==========================================
-function extractUser(req) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return null;
-    try {
-        return jwt.verify(token, JWT_SECRET);
-    } catch {
-        return null;
+app.post('/api/auth/register', async (req, res) => {
+    const { username, password, role } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required.' });
     }
-}
+    if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    }
 
-// ==========================================
-// RESOLVERS
-// ==========================================
-const rootValue = {
-    // ----- QUERIES -----
+    // Only allow 'admin' or 'staff'; default to 'staff'
+    const assignedRole = ['admin', 'staff', 'nurse'].includes(role) ? role : 'staff';
 
-    verifyToken: ({ }, { req }) => {
-        const user = extractUser(req);
-        if (!user) return { valid: false, error: 'Token is invalid or expired.' };
-        return { valid: true, user };
-    },
-
-    users: async ({ }, { req }) => {
-        const user = extractUser(req);
-        if (!user) throw new Error('Authentication required.');
-        if (user.role !== 'admin') throw new Error('Forbidden: Insufficient permissions.');
-
-        const [rows] = await db.query('SELECT id, username, role, created_at FROM users');
-        return rows;
-    },
-
-    // ----- MUTATIONS -----
-
-    register: async ({ username, password, role }) => {
-        if (!username || !password) throw new Error('Username and password are required.');
-        if (password.length < 6) throw new Error('Password must be at least 6 characters.');
-
-        const assignedRole = ['admin', 'staff', 'nurse'].includes(role) ? role : 'staff';
-
+    try {
         const [existing] = await db.query('SELECT id FROM users WHERE username = ?', [username]);
-        if (existing.length > 0) throw new Error('Username already taken.');
+        if (existing.length > 0) {
+            return res.status(409).json({ error: 'Username already taken.' });
+        }
 
         const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
         const [result] = await db.query(
@@ -151,21 +69,38 @@ const rootValue = {
             [username, password_hash, assignedRole]
         );
 
-        return {
+        res.status(201).json({
             message: 'User registered successfully.',
             user: { id: result.insertId, username, role: assignedRole }
-        };
-    },
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    login: async ({ username, password }) => {
-        if (!username || !password) throw new Error('Username and password are required.');
+// ==========================================
+// POST /api/auth/login
+// Body: { username, password }
+// Returns: { token, user: { id, username, role } }
+// ==========================================
+app.post('/api/auth/login', async (req, res) => {
+    const { username, password } = req.body;
 
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    try {
         const [rows] = await db.query('SELECT * FROM users WHERE username = ?', [username]);
-        if (rows.length === 0) throw new Error('Invalid username or password.');
+        if (rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid username or password.' });
+        }
 
         const user = rows[0];
         const passwordMatch = await bcrypt.compare(password, user.password_hash);
-        if (!passwordMatch) throw new Error('Invalid username or password.');
+        if (!passwordMatch) {
+            return res.status(401).json({ error: 'Invalid username or password.' });
+        }
 
         const token = jwt.sign(
             { id: user.id, username: user.username, role: user.role },
@@ -173,34 +108,91 @@ const rootValue = {
             { expiresIn: '8h' }
         );
 
-        return {
+        res.json({
             message: 'Login successful.',
             token,
             user: { id: user.id, username: user.username, role: user.role }
-        };
-    },
-
-    deleteUser: async ({ id }, { req }) => {
-        const requestingUser = extractUser(req);
-        if (!requestingUser) throw new Error('Authentication required.');
-        if (requestingUser.role !== 'admin') throw new Error('Forbidden: Insufficient permissions.');
-        if (parseInt(id) === requestingUser.id) throw new Error('You cannot delete your own account.');
-
-        const [result] = await db.query('DELETE FROM users WHERE id = ?', [id]);
-        if (result.affectedRows === 0) throw new Error('User not found.');
-
-        return { message: 'User deleted successfully.' };
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-};
+});
 
 // ==========================================
-// GRAPHQL ENDPOINT
+// GET /api/auth/verify
+// Header: Authorization: Bearer <token>
+// Used by gateway or frontends to validate tokens
 // ==========================================
-app.use('/graphql', graphqlHTTP((req) => ({
-    schema,
-    rootValue,
-    graphiql: true,
-    context: { req }
-})));
+app.get('/api/auth/verify', (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-app.listen(3004, () => console.log('🔐 Auth Service (GraphQL) running on port 3004 → http://localhost:3004/graphql'));
+    if (!token) {
+        return res.status(401).json({ error: 'No token provided.' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        res.json({ valid: true, user: decoded });
+    } catch (err) {
+        res.status(401).json({ valid: false, error: 'Token is invalid or expired.' });
+    }
+});
+
+// ==========================================
+// GET /api/auth/users  (admin only, for management)
+// ==========================================
+app.get('/api/auth/users', verifyToken, requireRole('admin'), async (req, res) => {
+    try {
+        const [rows] = await db.query('SELECT id, username, role, created_at FROM users');
+        res.json({ data: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// DELETE /api/auth/users/:id  (admin only)
+// ==========================================
+app.delete('/api/auth/users/:id', verifyToken, requireRole('admin'), async (req, res) => {
+    try {
+        // Prevent self-deletion
+        if (parseInt(req.params.id) === req.user.id) {
+            return res.status(400).json({ error: 'You cannot delete your own account.' });
+        }
+        const [result] = await db.query('DELETE FROM users WHERE id = ?', [req.params.id]);
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        res.json({ message: 'User deleted successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// MIDDLEWARE HELPERS
+// ==========================================
+function verifyToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required.' });
+
+    try {
+        req.user = jwt.verify(token, JWT_SECRET);
+        next();
+    } catch {
+        res.status(401).json({ error: 'Invalid or expired token.' });
+    }
+}
+
+function requireRole(role) {
+    return (req, res, next) => {
+        if (req.user.role !== role) {
+            return res.status(403).json({ error: 'Forbidden: Insufficient permissions.' });
+        }
+        next();
+    };
+}
+
+app.listen(3004, () => console.log('🔐 Auth Service running on port 3004'));

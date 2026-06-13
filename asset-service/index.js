@@ -1,13 +1,12 @@
 const express = require('express');
 const mysql = require('mysql2');
 const QRCode = require('qrcode');
-const { graphqlHTTP } = require('express-graphql');
-const { buildSchema } = require('graphql');
 require('dotenv').config();
 
 const app = express();
-// app.use(express.json());
+app.use(express.json());
 
+// Isolated connection just for the Asset Service
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     port: process.env.DB_PORT,
@@ -16,237 +15,187 @@ const db = mysql.createPool({
     database: process.env.DB_NAME
 }).promise();
 
-// ==========================================
-// GRAPHQL SCHEMA
-// ==========================================
-const schema = buildSchema(`
-    type Asset {
-        id: ID!
-        name: String!
-        type: String
-        sub_category: String
-        current_ward: String
-        qr_hash: String
-        status: String
-    }
-
-    type QRImage {
-        message: String!
-        image: String!
-    }
-
-    type AssetResult {
-        message: String!
-    }
-
-    type MaintenanceReport {
-        id: ID!
-        asset_id: ID!
-        asset_name: String
-        type: String
-        report_date: String
-        description: String
-        reporter: String
-        status: String
-        created_at: String
-        action_date: String
-        vendor: String
-        cost: Float
-        duration_days: Int
-        action_notes: String
-    }
-
-    type MaintenanceResult {
-        message: String!
-        id: ID
-    }
-
-    type WardUpdateResult {
-        message: String!
-    }
-
-    type Query {
-        """Fetch all assets."""
-        assets: [Asset!]!
-
-        """Validate and fetch a single asset by its QR hash."""
-        assetByQR(hash: String!): Asset
-
-        """Get all maintenance reports, newest first."""
-        maintenanceReports: [MaintenanceReport!]!
-
-        """Get maintenance history for a specific asset."""
-        maintenanceByAsset(asset_id: ID!): [MaintenanceReport!]!
-
-        """Generate a base64 QR code image for a given hash."""
-        generateQR(hash: String!): QRImage!
-    }
-
-    type Mutation {
-        """Add a new asset."""
-        addAsset(
-            name: String!
-            type: String
-            sub_category: String
-            current_ward: String!
-            qr_hash: String!
-        ): AssetResult!
-
-        """Update an asset's current ward and status."""
-        updateAssetLocation(id: ID!, current_ward: String!, status: String!): AssetResult!
-
-        """Update a ward's name, cascading to all assets in that ward."""
-        updateWardName(id: ID!, ward_name: String!): WardUpdateResult!
-
-        """Delete an asset. Blocked if In Use or In Transit."""
-        deleteAsset(id: ID!): AssetResult!
-
-        """Submit a new maintenance/damage report."""
-        createMaintenanceReport(
-            asset_id: ID!
-            asset_name: String
-            type: String
-            report_date: String!
-            description: String!
-            reporter: String
-        ): MaintenanceResult!
-
-        """Log a follow-up action for a maintenance report."""
-        addMaintenanceAction(
-            report_id: ID!
-            start_date: String
-            estimated_end_date: String
-            action_date: String
-            vendor: String
-            cost: Float
-            duration_days: Int
-            notes: String
-            status: String
-        ): MaintenanceResult!
-    }
-`);
-
-// ==========================================
-// RESOLVERS
-// ==========================================
-const rootValue = {
-    // ----- QUERIES -----
-
-    assets: async () => {
+// 1. Get all assets
+app.get('/api/assets', async (req, res) => {
+    try {
         const [rows] = await db.query('SELECT * FROM assets');
-        return rows;
-    },
+        res.json({ message: "Assets fetched", data: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    assetByQR: async ({ hash }) => {
-        const [rows] = await db.query('SELECT * FROM assets WHERE qr_hash = ?', [hash]);
-        if (rows.length === 0) throw new Error('Asset not found');
-        return rows[0];
-    },
+// 2. Validate asset by QR Hash
+app.get('/api/assets/qr/:hash', async (req, res) => {
+    try {
+        const [rows] = await db.query('SELECT * FROM assets WHERE qr_hash = ?', [req.params.hash]);
+        if (rows.length === 0) return res.status(404).json({ error: "Asset not found" });
+        res.json({ message: "Asset valid", data: rows[0] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    generateQR: async ({ hash }) => {
-        const image = await QRCode.toDataURL(hash);
-        return { message: 'QR Code generated', image };
-    },
+// 3. Update asset location
+app.put('/api/assets/:id/location', async (req, res) => {
+    try {
+        const { current_ward, status } = req.body;
+        await db.query('UPDATE assets SET current_ward = ?, status = ? WHERE id = ?', [current_ward, status, req.params.id]);
+        res.json({ message: "Asset location updated" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    maintenanceReports: async () => {
-        const [rows] = await db.query('SELECT * FROM maintenance_reports ORDER BY created_at DESC');
-        return rows;
-    },
+app.put('/api/wards/:id', async function(req, res) {
+    var newName = req.body.ward_name;
+    try {
+        var oldData = await db.query("SELECT ward_name FROM wards WHERE id = ?", [req.params.id]);
+        if (oldData[0].length > 0) {
+            var oldName = oldData[0][0].ward_name;
+            await db.query("UPDATE wards SET ward_name = ? WHERE id = ?", [newName, req.params.id]);
+            await db.query("UPDATE assets SET current_ward = ? WHERE current_ward = ?", [newName, oldName]);
+        }
+        res.json({ message: "Ruangan berhasil diupdate" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    maintenanceByAsset: async ({ asset_id }) => {
-        const [rows] = await db.query(
-            `SELECT r.*,
-                    a.action_date, a.vendor, a.cost, a.duration_days, a.notes AS action_notes
-             FROM maintenance_reports r
-             LEFT JOIN maintenance_actions a ON a.report_id = r.id
-             WHERE r.asset_id = ?
-             ORDER BY r.created_at DESC`,
-            [asset_id]
-        );
-        return rows;
-    },
+// ==========================================
+// [!] NEW MISSING ROUTES ADDED BELOW
+// ==========================================
 
-    // ----- MUTATIONS -----
-
-    addAsset: async ({ name, type, sub_category, current_ward, qr_hash }) => {
+// Tambah aset baru
+app.post('/api/assets', async (req, res) => {
+    const { name, type, sub_category, current_ward, qr_hash } = req.body;
+    try {
         await db.query(
             'INSERT INTO assets (name, type, sub_category, current_ward, qr_hash) VALUES (?, ?, ?, ?, ?)',
             [name, type, sub_category || '-', current_ward, qr_hash]
         );
-        return { message: 'Asset added successfully' };
-    },
+        res.json({ message: 'Asset added successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    updateAssetLocation: async ({ id, current_ward, status }) => {
-        await db.query(
-            'UPDATE assets SET current_ward = ?, status = ? WHERE id = ?',
-            [current_ward, status, id]
+// 5. Generate QR Code Image (Used by index.html Print QR Modal)
+app.get('/api/assets/qr/generate/:hash', async (req, res) => {
+    try {
+        const hash = req.params.hash;
+        const qrImageBase64 = await QRCode.toDataURL(hash);
+        res.json({ message: "QR Code generated", image: qrImageBase64 });
+    } catch (err) {
+        console.error("Failed to generate QR", err);
+        res.status(500).json({ error: "Failed to generate QR code" });
+    }
+});
+
+// 6. Delete an asset (Used by index.html Delete button)
+app.delete('/api/assets/:id', async (req, res) => {
+    try {
+        // First, check the status of the asset
+        const [rows] = await db.query('SELECT status FROM assets WHERE id = ?', [req.params.id]);
+        
+        if (rows.length === 0) {
+            return res.status(404).json({ error: "Asset not found" });
+        }
+        if (rows[0].status === 'In Use') {
+            return res.status(400).json({ error: "Action Denied: Cannot delete an asset that is currently In Use." });
+        }
+        if (rows[0].status === 'In Transit') {
+            return res.status(400).json({ error: "Action Denied: Cannot delete an asset that is In Transit." });
+        }
+
+        // If safe, delete it
+        await db.query('DELETE FROM assets WHERE id = ?', [req.params.id]);
+        res.json({ message: "Asset deleted successfully" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+// ==========================================
+// [!] Maintenenc
+// ==========================================
+// GET all maintenance reports
+app.get('/api/maintenance', async (req, res) => {
+    try {
+        const [rows] = await db.query(
+            'SELECT * FROM maintenance_reports ORDER BY created_at DESC'
         );
-        return { message: 'Asset location updated' };
-    },
+        res.json({ data: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    updateWardName: async ({ id, ward_name }) => {
-        const [oldData] = await db.query('SELECT ward_name FROM wards WHERE id = ?', [id]);
-        if (oldData.length > 0) {
-            const oldName = oldData[0].ward_name;
-            await db.query('UPDATE wards SET ward_name = ? WHERE id = ?', [ward_name, id]);
-            await db.query('UPDATE assets SET current_ward = ? WHERE current_ward = ?', [ward_name, oldName]);
-        }
-        return { message: 'Ward updated successfully' };
-    },
-
-    deleteAsset: async ({ id }) => {
-        const [rows] = await db.query('SELECT status FROM assets WHERE id = ?', [id]);
-        if (rows.length === 0) throw new Error('Asset not found');
-        if (rows[0].status === 'In Use') throw new Error('Action Denied: Cannot delete an asset that is currently In Use.');
-        if (rows[0].status === 'In Transit') throw new Error('Action Denied: Cannot delete an asset that is In Transit.');
-
-        await db.query('DELETE FROM assets WHERE id = ?', [id]);
-        return { message: 'Asset deleted successfully' };
-    },
-
-    createMaintenanceReport: async ({ asset_id, asset_name, type, report_date, description, reporter }) => {
-        if (!asset_id || !description || !report_date) {
-            throw new Error('asset_id, report_date, and description are required.');
-        }
+// POST a new damage report
+app.post('/api/maintenance', async (req, res) => {
+    const { asset_id, asset_name, type, report_date, description, reporter } = req.body;
+    if (!asset_id || !description || !report_date) {
+        return res.status(400).json({ error: 'asset_id, report_date, and description are required.' });
+    }
+    try {
         const [result] = await db.query(
             `INSERT INTO maintenance_reports (asset_id, asset_name, type, report_date, description, reporter)
              VALUES (?, ?, ?, ?, ?, ?)`,
             [asset_id, asset_name || '', type || '', report_date, description, reporter || '']
         );
-        return { message: 'Report created', id: result.insertId };
-    },
+        res.status(201).json({ message: 'Report created', id: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-    addMaintenanceAction: async ({ report_id, start_date, estimated_end_date, action_date, vendor, cost, duration_days, notes, status }) => {
+// POST a follow-up action for a report
+app.post('/api/maintenance/:id/action', async (req, res) => {
+    const { action_date, vendor, cost, duration_days, notes, status, start_date, estimated_end_date } = req.body;
+    const reportId = req.params.id;
+    try {
         await db.query(
             `INSERT INTO maintenance_actions (report_id, start_date, estimated_end_date, action_date, vendor, cost, duration_days, notes, status)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                report_id,
-                start_date || null,
-                estimated_end_date || null,
-                action_date || null,
-                vendor || '',
-                cost || 0,
-                duration_days || 0,
-                notes || '',
+                reportId, 
+                start_date || null, 
+                estimated_end_date || null, 
+                action_date || null,   // <-- Ini kunci fix-nya
+                vendor || '', 
+                cost || 0, 
+                duration_days || 0, 
+                notes || '', 
                 status || 'Diperbaiki'
             ]
         );
+        // Update report status
         await db.query(
             'UPDATE maintenance_reports SET status = ? WHERE id = ?',
-            [status || 'Diperbaiki', report_id]
+            [status || 'Diperbaiki', reportId]
         );
-        return { message: 'Action logged and report updated.' };
+        res.json({ message: 'Action logged and report updated.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
-};
+});
+// GET maintenance history for a specific asset
+app.get('/api/maintenance/asset/:asset_id', async (req, res) => {
+    try {
+        const [rows] = await db.query(
+            `SELECT r.*, 
+                    a.action_date, a.vendor, a.cost, a.duration_days, a.notes AS action_notes
+             FROM maintenance_reports r
+             LEFT JOIN maintenance_actions a ON a.report_id = r.id
+             WHERE r.asset_id = ?
+             ORDER BY r.created_at DESC`,
+            [req.params.asset_id]
+        );
+        res.json({ data: rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-// ==========================================
-// GRAPHQL ENDPOINT
-// ==========================================
-app.use('/graphql', graphqlHTTP({
-    schema,
-    rootValue,
-    graphiql: true
-}));
-
-app.listen(3001, () => console.log('📦 Asset Service (GraphQL) running on port 3001 → http://localhost:3001/graphql'));
+app.listen(3001, () => console.log('📦 Asset Service running on port 3001'));

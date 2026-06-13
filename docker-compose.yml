@@ -1,13 +1,63 @@
-version: '3.8'
-
 services:
-  backend:
-    build: .
+  gateway:
+    build: ./gateway
     ports:
       - "3000:3000"
+    environment:
+      - PORT=3000
+      - JWT_SECRET=hospital_asset_jwt_secret_change_in_prod
+    depends_on:
+      - auth-service
+      - asset-service
+      - ward-service
+      - transfer-service
+
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "3004:3004"
     dns:
       - 8.8.8.8
       - 8.8.4.4
+    environment:
+      - PORT=3004
+    env_file:
+      - .env
+
+  asset-service:
+    build: ./asset-service
+    ports:
+      - "3001:3001"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - PORT=3001
+    env_file:
+      - .env
+
+  ward-service:
+    build: ./ward-service
+    ports:
+      - "3002:3002"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - PORT=3002
+    env_file:
+      - .env
+
+  transfer-service:
+    build: ./transfer-service
+    ports:
+      - "3003:3003"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - PORT=3003
+      - ASSET_SERVICE_URL=http://asset-service:3001
     env_file:
       - .env
 
@@ -16,4 +66,4 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - backend
+      - gateway
